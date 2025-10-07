@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../Users/Maksym/OneDrive/Документи/PlatformIO/Projects/test"
+		},
+		{
+			"name": "ovul_cam_template",
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"typeinfo": "cpp"
+		}
+	}
+}
