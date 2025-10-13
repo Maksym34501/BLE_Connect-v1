@@ -1,3 +1,6 @@
+# 1 "C:\\Users\\Maksym\\AppData\\Local\\Temp\\tmppsfycxmq"
+#include <Arduino.h>
+# 1 "C:/ovul_cam_template/src/CameraWebServer.ino"
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <BLEDevice.h>
@@ -6,20 +9,20 @@
 #include <BLE2902.h>
 #include "esp_sleep.h"
 
-// ==== ПІНИ (під твою розпіновку) ====
-#define OPEN_SW_PIN     GPIO_NUM_18   // геркон / магніт (INPUT_PULLUP) - перевірати чи RTC-GPIO!
-#define LED_SIDE_PIN    GPIO_NUM_21
-#define RGB_DIN_PIN     GPIO_NUM_20
-#define RGB_VDD_PIN     GPIO_NUM_19
 
-// Якщо твоя плата НЕ підтримує ext0 wake на GPIO18, заміни OPEN_SW_PIN на RTC-capable pin (напр. GPIO_NUM_33)
-// #define OPEN_SW_PIN     GPIO_NUM_33
+#define OPEN_SW_PIN GPIO_NUM_18
+#define LED_SIDE_PIN GPIO_NUM_21
+#define RGB_DIN_PIN GPIO_NUM_20
+#define RGB_VDD_PIN GPIO_NUM_19
 
-// ==== ПАРАМЕТРИ часу (ms) ====
-#define CONNECT_WAIT_MS       30000UL   // 30 s очікування для підключення
-#define AFTER_CONNECT_MS      60000UL   // 1 min таймер після успішного підключення
-#define ADV_CONNECT_TIMEOUT   10000UL   // 10 s очікування для відправки "123" після пробудження
-#define DEBOUNCE_MS           50UL
+
+
+
+
+#define CONNECT_WAIT_MS 30000UL
+#define AFTER_CONNECT_MS 60000UL
+#define ADV_CONNECT_TIMEOUT 10000UL
+#define DEBOUNCE_MS 50UL
 
 Adafruit_NeoPixel rgb(1, RGB_DIN_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -36,8 +39,8 @@ bool waitingForConnectWindow = false;
 bool inPurpleTimer = false;
 bool justWokeUp = false;
 
-// UUIDs
-#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+
+#define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 class MyServerCallbacks : public BLEServerCallbacks {
@@ -51,7 +54,14 @@ class MyServerCallbacks : public BLEServerCallbacks {
     pServer->startAdvertising();
   }
 };
-
+void setupBLE();
+void setRGB(uint8_t r, uint8_t g, uint8_t b);
+void sendNotify(const char* msg);
+void goToSleepUntilMagnetChange(bool wakeOnHigh);
+void indicateBlink(uint8_t r, uint8_t g, uint8_t b, int times, int onMs, int offMs);
+void setup();
+void loop();
+#line 55 "C:/ovul_cam_template/src/CameraWebServer.ino"
 void setupBLE() {
   BLEDevice::init("ESP32-DOOR");
   pServer = BLEDevice::createServer();
@@ -67,7 +77,7 @@ void setupBLE() {
   Serial.println("📡 BLE ready & advertising...");
 }
 
-// RGB helper (r,g,b: 0..255)
+
 void setRGB(uint8_t r, uint8_t g, uint8_t b) {
   digitalWrite(RGB_VDD_PIN, HIGH);
   rgb.setPixelColor(0, rgb.Color(r, g, b));
@@ -90,7 +100,7 @@ void goToSleepUntilMagnetChange(bool wakeOnHigh) {
   Serial.println(")");
   setRGB(0,0,0);
   delay(50);
-  // ext0: один RTC GPIO, wake on level (0 або 1)
+
   esp_sleep_enable_ext0_wakeup(OPEN_SW_PIN, wakeOnHigh ? 1 : 0);
   esp_deep_sleep_start();
 }
@@ -108,8 +118,8 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  // Піни
-  pinMode(OPEN_SW_PIN, INPUT_PULLUP); // припускаємо геркон до GND коли магніт є (LOW = magnet present)
+
+  pinMode(OPEN_SW_PIN, INPUT_PULLUP);
   pinMode(LED_SIDE_PIN, OUTPUT);
   pinMode(RGB_VDD_PIN, OUTPUT);
   digitalWrite(RGB_VDD_PIN, HIGH);
@@ -117,7 +127,7 @@ void setup() {
 
   setupBLE();
 
-  // Якщо проснувся з deep sleep - визначимо це
+
   if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED) {
     justWokeUp = true;
     wakeStart = millis();
@@ -126,46 +136,46 @@ void setup() {
     justWokeUp = false;
   }
 
-  // стартове світло (зелений) — припустимо 'закрито' спочатку
+
   setRGB(0, 255, 0);
   Serial.println("🚀 Boot complete.");
 }
 
 void loop() {
   unsigned long now = millis();
-  bool raw = digitalRead(OPEN_SW_PIN); // при INPUT_PULLUP: HIGH = open (magnet removed), LOW = closed (magnet present)
+  bool raw = digitalRead(OPEN_SW_PIN);
   bool magnetPresent = (raw == LOW);
 
-  // --- Обробка пробудження: якщо щойно прокинувся, рекламуюсь і чекаю підключення для "123" ---
+
   if (justWokeUp) {
     justWokeUp = false;
     Serial.println("🔔 After wake: advertising and waiting for central to connect...");
-    setRGB(255, 255, 0); // жовтий при індикації підключення після сну
+    setRGB(255, 255, 0);
     wakeStart = now;
-    // реклама вже запущена у setupBLE(), але переконаємося
+
     pServer->startAdvertising();
-    // ВАЖЛИВО: При пробудженні ми очікуємо, що централь підключиться для отримання "123"
+
   }
 
   if (wakeStart > 0 && (now - wakeStart) < ADV_CONNECT_TIMEOUT) {
-    // чекаємо підключення; якщо з'явилось - відправляємо "123"
+
     if (deviceConnected) {
       sendNotify("123");
-      indicateBlink(255, 255, 0, 2, 120, 80); // дві блимки жовтого
+      indicateBlink(255, 255, 0, 2, 120, 80);
       wakeStart = 0;
       delay(100);
-      // після відправки — йдемо в сон, чекаючи повернення магніту (LOW) або зняття — залежить від логіки
-      // Якщо ми пробудилися коли магніт був піднесений, і хочемо чекати ПОВЕРНЕННЯ магніту -> wakeOnHigh = false
+
+
       goToSleepUntilMagnetChange(false);
     }
   } else if (wakeStart > 0 && (now - wakeStart) >= ADV_CONNECT_TIMEOUT) {
-    // не підключились — йдемо в сон до повернення магніту
+
     Serial.println("⏳ No central connected after wake -> sleep until magnet returns");
     wakeStart = 0;
     goToSleepUntilMagnetChange(false);
   }
 
-  // --- Обробка зміни стану геркона (debounce) ---
+
   static unsigned long lastDebounce = 0;
   static bool lastMagnetPresent = magnetPresent;
   if (magnetPresent != lastMagnetPresent) {
@@ -173,19 +183,19 @@ void loop() {
     lastMagnetPresent = magnetPresent;
   }
   if ((now - lastDebounce) > DEBOUNCE_MS) {
-    // стабільний стан
+
     if (!magnetPresent) {
-      // OPEN (магніт ЗНЯТО) => телефонуємо підключитись
+
       if (openSince == 0) {
         openSince = now;
         Serial.println("🚪 OPEN (магніт знято)");
-        setRGB(0, 0, 255); // синій - очікуємо підключення
+        setRGB(0, 0, 255);
         waitingForConnectWindow = true;
         connectStart = now;
-        // реклама має йти; очікуємо підключення
+
       }
     } else {
-      // CLOSED (магніт ПОВЕРНУВСЯ)
+
       if (openSince != 0) {
         Serial.println("🔒 CLOSED (магніт повернувся)");
         openSince = 0;
@@ -195,52 +205,52 @@ void loop() {
         purpleStart = 0;
         if (deviceConnected) sendNotify("CLOSE");
         delay(50);
-        // ПРИ ЗАКРИТТІ йдемо в deep sleep, будемо пробуджуватись при OPEN (тобто коли magnet removed)
-        // якщо magnetPresent == true у тебе означає LOW, то пробудження на HIGH:
+
+
         goToSleepUntilMagnetChange(true);
       }
     }
   }
 
-  // --- Якщо відкрита і чекаємо підключення ---
+
   if (waitingForConnectWindow && openSince > 0) {
-    // якщо підключення відбулося в цей час
+
     if (deviceConnected) {
       Serial.println("✅ Connected during 30s window -> blink green x3");
-      indicateBlink(0,255,0,3,120,120); // 3× миг зелене
+      indicateBlink(0,255,0,3,120,120);
       waitingForConnectWindow = false;
-      // переходимо в "фіолетовий таймер" (1 хв)
+
       inPurpleTimer = true;
       purpleStart = now;
-      setRGB(128,0,128); // фіолетовий
-      // повідомимо централь
+      setRGB(128,0,128);
+
       sendNotify("CONNECTED_OK");
     } else if ((now - connectStart) >= CONNECT_WAIT_MS) {
-      // пройшло 30с і ніхто не підключився -> червоний і deep sleep до повернення магніту
+
       Serial.println("⏱ 30s passed without connect -> RED & deep sleep until magnet");
-      setRGB(255,0,0); // червоний
+      setRGB(255,0,0);
       waitingForConnectWindow = false;
       connectStart = 0;
       delay(80);
-      // очікуємо повернення магніту (тобто magnetPresent == true -> LOW wake), тому wakeOnHigh = false
+
       goToSleepUntilMagnetChange(false);
     }
   }
 
-  // --- Фіолетовий таймер (1 хв) після успішного підключення ---
+
   if (inPurpleTimer) {
     if ((now - purpleStart) >= AFTER_CONNECT_MS) {
       Serial.println("⏲ Purple 1min finished -> go to deep sleep, will attempt notify after wake");
       inPurpleTimer = false;
       purpleStart = 0;
       delay(80);
-      // йдемо в сон; після пробудження ми чекатимемо підключення і відправимо "123"
-      // Приходячи в сон після фіолетового стану — ми, ймовірно, хочемо прокинутись коли магніт повернеться (LOW)
+
+
       goToSleepUntilMagnetChange(false);
     }
   }
 
-  // --- періодична відправка статусу коли підключено ---
+
   static unsigned long lastStatusSend = 0;
   if (deviceConnected && (now - lastStatusSend) > 5000UL) {
     lastStatusSend = now;
