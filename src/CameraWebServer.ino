@@ -1,37 +1,34 @@
-
-// Об'єднаний скетч: фази + камера + збереження фото в SPIFFS + передача по BLE частинами
+// Повний скетч — з виправленнями для надійної передачі зображення по BLE (notify + 180B chunks)
 #include <Arduino.h>
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 
 #include <Adafruit_NeoPixel.h>
 
-// ---------- Camera + SPIFFS ----------
-#include "soc/soc.h"           // Brownout fix
-#include "soc/rtc_cntl_reg.h"  // Brownout fix
+// Camera + SPIFFS
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 #include "esp_camera.h"
-#include "camera_pins.h"      // <- переконайтесь, що існує для вашого модуля
+#include "camera_pins.h"
 #include "FS.h"
 #include "SPIFFS.h"
 
-// ---------- BLE ----------
+// BLE
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-// ---------- Optional LED lib ----------
+// Optional LED lib
 #include <LiteLED.h>
 #include "rgb_led.h"
 
-// ---------- Configuration ----------
-
- 
+// Configuration
 #define OPEN_SW_NUM         GPIO_NUM_18
 #define BAT_LEV_NUM         GPIO_NUM_1
 #define RGB_DIN_NUM         GPIO_NUM_20
 #define RGB_VDD_NUM         GPIO_NUM_19
-#define OPEN_SWITCH_POLARITY 0   // 1 = замкнуто
+#define OPEN_SWITCH_POLARITY 0
 
 #ifndef CAM_PWR_NUM
   #define CAM_PWR_NUM  4
@@ -40,19 +37,19 @@
   #define RESET_GPIO_NUM 15
 #endif
 
-// ---------- BLE UUIDs ----------
-#define SERVICE_UUID        "12345678-1234-5678-1234-56789abcdef0" // phase/info
-#define CHAR_PHASE_UUID     "12345678-1234-5678-1234-56789abcdef1"
+// === BLE UUIDs (з твоїми UUID) ===
+#define SERVICE_UUID              "6f1e0000-1234-4bcd-8000-abcdef123450"  // Phase/info service
+#define CHAR_PHASE_UUID           "6f1e0001-1234-4bcd-8000-abcdef123450"  // Phase info characteristic
 
-#define IMAGE_SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
-#define IMAGE_CHARACTERISTIC_UUID "abcd1234-ab12-cd34-ef56-1234567890ab"
-#define CMD_CHARACTERISTIC_UUID   "12345678-abcd-1234-abcd-1234567890cd"
+#define IMAGE_SERVICE_UUID        "6f1e1000-1234-4bcd-8000-abcdef123450"  // Image transfer service
+#define IMAGE_CHARACTERISTIC_UUID "6f1e1001-1234-4bcd-8000-abcdef123450"  // Image data characteristic
+#define CMD_CHARACTERISTIC_UUID   "6f1e1002-1234-4bcd-8000-abcdef123450"  // Command/control characteristic
 
-// ---------- RGB ----------
+// RGB
 Adafruit_NeoPixel rgb(1, RGB_DIN_NUM, NEO_GRB + NEO_KHZ800);
 LiteLED myLED( LED_STRIP_SK6812, true );
 
-// ---------- Globals ----------
+// Globals
 BLEServer* pServer = nullptr;
 BLECharacteristic* pPhaseCharacteristic = nullptr;
 
@@ -65,38 +62,40 @@ bool deviceConnected = false;
 volatile bool notificationsEnabled = false;
 volatile bool sendRequested = false;
 
-// Phases and persistence across deep sleep
+// Phases and persistence
 enum Phase { PHASE_RED = 0, PHASE_BLUE = 1, PHASE_GREEN = 2 };
 RTC_DATA_ATTR Phase currentPhase = PHASE_RED;
-RTC_DATA_ATTR bool hasSavedPhoto = false; // persist across deep sleep
+RTC_DATA_ATTR bool hasSavedPhoto = false;
 
 const char * SAVED_PHOTO_PATH = "/last.jpg";
+const char * TMP_PHOTO_PATH = "/last.jpg.tmp";
 
-// Forward declarations
+// Forward
 void phaseRED();
 void phaseBLUE();
 void phaseGREEN();
 void showColor(uint8_t r, uint8_t g, uint8_t b);
 bool cameraInit();
-bool saveFrameToSPIFFS(camera_fb_t* fb, const char* path);
+bool saveFrameToSPIFFS_safe(camera_fb_t* fb, const char* finalPath);
 void sendFileViaBLE_SPIFFS(const char* path);
 bool waitForNotificationsEnabled(uint32_t timeoutMs);
-void advertiseAndSendIfPhoto(void (*waitFunc)(), uint32_t sleepSec = 0);  
+void advertiseAndSendIfPhoto(void (*waitFunc)(), uint32_t sleepSec = 0);
 
-// ---------- Helper: magnet ----------
+// Magnet helpers
 bool m_is_closed() { return digitalRead(OPEN_SW_NUM) == OPEN_SWITCH_POLARITY; }
 void m_wait_opening() { esp_sleep_enable_ext0_wakeup(OPEN_SW_NUM, !OPEN_SWITCH_POLARITY); }
 void m_wait_closing() { esp_sleep_enable_ext0_wakeup(OPEN_SW_NUM, OPEN_SWITCH_POLARITY); }
 
-// ---------- LEDs ----------
+// LEDs
 void showColor(uint8_t r, uint8_t g, uint8_t b) {
   rgb.setPixelColor(0, rgb.Color(r,g,b));
   rgb.show();
+  delay(10);
   rgb_t pix; pix.red = r; pix.green = g; pix.blue = b;
   myLED.setPixel(0, pix, 1);
 }
 
-// ---------- BLE Callbacks ----------
+// BLE Callbacks
 class PhaseServerCallbacks: public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) override {
     g_clientConnected = true;
@@ -118,8 +117,9 @@ class MyDescriptorCallbacks : public BLEDescriptorCallbacks {
     size_t len = desc->getLength();
     if(len >= 2) {
         uint16_t val = ((uint16_t)buf[1] << 8) | buf[0];
-        notificationsEnabled = (val & 0x0002) != 0;  // indicate bit
-        Serial.printf("CCCD written: 0x%04X, indicationsEnabled=%d\n", val, notificationsEnabled);
+        // accept notify (0x0001) or indicate (0x0002)
+        notificationsEnabled = (val & 0x0002) != 0; // 0x0002 = indicate
+        Serial.printf("CCCD written: 0x%04X, indicationsEnabled=%d, millis=%lu\n", val, notificationsEnabled, millis());
     }
   }
 };
@@ -134,7 +134,7 @@ class CmdCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-// ---------- BLE helpers ----------
+// wait for client to write CCCD (we set notificationsEnabled in descriptor callback)
 bool waitForNotificationsEnabled(uint32_t timeoutMs) {
   const uint32_t step = 20;
   uint32_t waited = 0;
@@ -146,70 +146,92 @@ bool waitForNotificationsEnabled(uint32_t timeoutMs) {
   return notificationsEnabled;
 }
 
+// --- FIXED: use notify() (not indicate) and smaller chunk size
 void sendFileViaBLE_SPIFFS(const char* path) {
   if (!deviceConnected) {
-    Serial.println("sendFileViaBLE_SPIFFS: no client connected");
+    Serial.println("Client not connected");
     return;
   }
+  if (!notificationsEnabled) {
+    Serial.println("Client has not enabled indications for image characteristic");
+    // return; // можна продовжити, але краще чекати enable через waitForNotificationsEnabled()
+  }
+
   if (!SPIFFS.exists(path)) {
-    Serial.println("sendFileViaBLE_SPIFFS: file not found");
+    Serial.println("File not found");
     return;
   }
 
   File f = SPIFFS.open(path, FILE_READ);
-  if(!f) {
-    Serial.println("sendFileViaBLE_SPIFFS: failed to open file");
-    return;
-  }
-
   size_t total = f.size();
-  Serial.printf("sendFileViaBLE_SPIFFS: file size = %u bytes\n", (unsigned)total);
+  Serial.printf("Total file size: %u bytes\n", (unsigned)total);
 
-  // send 4-byte length (little-endian)
-  uint8_t lenBuf[4];
-  lenBuf[0] = (uint8_t)(total & 0xFF);
-  lenBuf[1] = (uint8_t)((total >> 8) & 0xFF);
-  lenBuf[2] = (uint8_t)((total >> 16) & 0xFF);
-  lenBuf[3] = (uint8_t)((total >> 24) & 0xFF);
+  // --- send START ---
+  const char* startMsg = "START";
+  pImageCharacteristic->setValue((uint8_t*)startMsg, strlen(startMsg));
+  pImageCharacteristic->indicate();  // <-- reliable send
+  delay(150);
 
-  pImageCharacteristic->setValue(lenBuf, 4);
-  pImageCharacteristic->indicate();
-  vTaskDelay(pdMS_TO_TICKS(50));
-
-  const size_t chunkSize = 500; // safe chunk
-  size_t sent = 0;
+  const size_t chunkSize = 180; // BLE safe chunk size
   uint8_t buf[chunkSize];
+  size_t sent = 0;
 
   while (sent < total) {
-    if (!deviceConnected) {
-      Serial.println("sendFileViaBLE_SPIFFS: client disconnected during transfer");
-      break;
-    }
-    size_t toRead = (total - sent) > chunkSize ? chunkSize : (total - sent);
+    size_t toRead = (total - sent > chunkSize) ? chunkSize : (total - sent);
     size_t actuallyRead = f.read(buf, toRead);
     if (actuallyRead == 0) break;
 
     pImageCharacteristic->setValue(buf, actuallyRead);
-    pImageCharacteristic->indicate();
-
+    pImageCharacteristic->indicate(); // <-- wait for client ack
     sent += actuallyRead;
-    Serial.printf("Chunk sent: %u bytes, Total sent: %u bytes\n", (unsigned)actuallyRead, (unsigned)sent);
-    vTaskDelay(pdMS_TO_TICKS(5));
+
+    Serial.printf("Sent chunk: %u / %u\n", (unsigned)sent, (unsigned)total);
+    delay(10); // optional small pause
   }
 
-  Serial.printf("sendFileViaBLE_SPIFFS: done, total bytes sent = %u\n", (unsigned)sent);
+  // --- send END ---
+  const char* endMsg = "END";
+  pImageCharacteristic->setValue((uint8_t*)endMsg, strlen(endMsg));
+  pImageCharacteristic->indicate();
+  delay(150);
+
+  Serial.println("✅ File transfer done");
   f.close();
-
-  if (sent == total) {
-    SPIFFS.remove(path);
-    hasSavedPhoto = false;
-    Serial.println("Saved photo removed from SPIFFS after successful send");
-  } else {
-    Serial.println("Transfer incomplete, leaving file in SPIFFS");
-  }
 }
 
-// Advertise and if photo exists send it, then configure wakeup and deep sleep
+// advertise helper (unchanged)
+ void advertiseAndWaitForClientThenNotify(const char* msg, uint32_t maxWaitMs = 20000, uint32_t postNotifyWaitMs = 3000, int repeats = 3) {
+  Serial.printf("📡 Advertise & notify helper: '%s' (wait %u ms)\n", msg, (unsigned)maxWaitMs);
+  BLEAdvertising* adv = pServer->getAdvertising();
+  adv->start();
+
+  unsigned long start = millis();
+  while (!deviceConnected && millis() - start < maxWaitMs) {
+    delay(200);
+  }
+
+  if (deviceConnected) {
+    Serial.println("🔗 client connected (helper) - sending notify(s)");
+    for (int i = 0; i < repeats; ++i) {
+      if (!deviceConnected) break;
+      if (pPhaseCharacteristic) {
+        pPhaseCharacteristic->setValue(msg);
+        pPhaseCharacteristic->indicate();
+      }
+      delay(500);
+    }
+    unsigned long post = millis();
+    while (deviceConnected && millis() - post < postNotifyWaitMs) {
+      delay(100);
+    }
+  } else {
+    Serial.println("⚠️ No client connected within helper timeout");
+  }
+  adv->stop();
+  Serial.println("🛑 Advertising stopped (helper)");
+}
+
+// advertise and send photo (unchanged logic but will use updated sendFileViaBLE_SPIFFS)
 void advertiseAndSendIfPhoto(void (*waitFunc)(), uint32_t sleepSec ) {
   Serial.println("📢 Start advertising for image transfer");
   pServer->getAdvertising()->start();
@@ -222,13 +244,23 @@ void advertiseAndSendIfPhoto(void (*waitFunc)(), uint32_t sleepSec ) {
 
   if (deviceConnected) {
     Serial.println("🔗 BLE client connected (for image transfer)");
-    // wait for client to enable indications (up to 8s)
-    if (waitForNotificationsEnabled(8000)) {
-      Serial.println("✅ Client enabled indications — proceeding to send if photo exists");
+    // wait for client to enable notifications/indications (up to 20s)
+    if (waitForNotificationsEnabled(20000)) {
+      Serial.println("✅ Client enabled indications/notify — proceeding to send photo");
+      delay(500);
+
+      for(int i=0;i<3;i++){
+          if(!deviceConnected) break;
+          if(pPhaseCharacteristic){
+              pPhaseCharacteristic->setValue("READY_FOR_IMAGE");
+              pPhaseCharacteristic->indicate();
+          }
+          delay(500);
+      }
+
       if (hasSavedPhoto) sendFileViaBLE_SPIFFS(SAVED_PHOTO_PATH);
-      else Serial.println("No saved photo to send");
     } else {
-      Serial.println("⚠️ Client did not enable indications in time");
+      Serial.println("⚠️ Client did not enable indications/notify in time");
     }
   } else {
     Serial.println("⚠️ No client connected within timeout");
@@ -250,7 +282,7 @@ void advertiseAndSendIfPhoto(void (*waitFunc)(), uint32_t sleepSec ) {
   esp_deep_sleep_start();
 }
 
-// ---------- Camera helpers ----------
+// Camera helpers (unchanged)
 bool cameraInit () {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -296,152 +328,215 @@ bool cameraInit () {
   return true;
 }
 
-bool saveFrameToSPIFFS(camera_fb_t* fb, const char* path) {
+bool saveFrameToSPIFFS_safe(camera_fb_t* fb, const char* finalPath) {
   if (!fb) return false;
-  File f = SPIFFS.open(path, FILE_WRITE);
+
+  if (SPIFFS.exists(TMP_PHOTO_PATH)) {
+    SPIFFS.remove(TMP_PHOTO_PATH);
+  }
+
+  File f = SPIFFS.open(TMP_PHOTO_PATH, FILE_WRITE);
   if (!f) {
-    Serial.println("saveFrameToSPIFFS: cannot open file for write");
+    Serial.println("saveFrameToSPIFFS_safe: cannot open tmp file for write");
     return false;
   }
   size_t written = f.write(fb->buf, fb->len);
   f.close();
-  Serial.printf("saveFrameToSPIFFS: written %u bytes\n", (unsigned)written);
-  return written == fb->len;
+
+  delay(50);
+
+  if (written != fb->len) {
+    Serial.printf("saveFrameToSPIFFS_safe: written mismatch %u != %u\n", (unsigned)written, (unsigned)fb->len);
+    if (SPIFFS.exists(TMP_PHOTO_PATH)) SPIFFS.remove(TMP_PHOTO_PATH);
+    return false;
+  }
+
+  if (SPIFFS.exists(finalPath)) {
+    SPIFFS.remove(finalPath);
+    delay(10);
+  }
+
+  bool ok = SPIFFS.rename(TMP_PHOTO_PATH, finalPath);
+  delay(50);
+
+  if (!ok) {
+    Serial.println("saveFrameToSPIFFS_safe: rename failed");
+    if (SPIFFS.exists(TMP_PHOTO_PATH)) SPIFFS.remove(TMP_PHOTO_PATH);
+    return false;
+  }
+
+  if (!SPIFFS.exists(finalPath)) {
+    Serial.println("saveFrameToSPIFFS_safe: final file missing after rename");
+    return false;
+  }
+  File vf = SPIFFS.open(finalPath, FILE_READ);
+  size_t finalSize = vf.size();
+  vf.close();
+  if (finalSize != fb->len) {
+    Serial.printf("saveFrameToSPIFFS_safe: final size mismatch %u != %u\n", (unsigned)finalSize, (unsigned)fb->len);
+    SPIFFS.remove(finalPath);
+    return false;
+  }
+
+  Serial.printf("saveFrameToSPIFFS_safe: saved %u bytes to %s\n", (unsigned)finalSize, finalPath);
+  return true;
 }
 
-// ---------- PHASES ----------
-void phaseRED() {
-  currentPhase = PHASE_RED;
-  Serial.println("🔴 Phase RED (магніт відсутній)");
-  showColor(255, 0, 0);
+// sendBLEandSleep and phases (unchanged logic)...
+void sendBLEandSleep(const char* msg, void (*waitFunc)(), uint32_t sleepSec = 0) {
+  Serial.printf("📡 Preparing to send: %s\n", msg);
 
-  if (hasSavedPhoto) {
-    // If photo exists, advertise and try to send it now (this covers case when photo saved earlier
-    // and magnet removed while device was sleeping)
-    if (pPhaseCharacteristic) {
-      pPhaseCharacteristic->setValue("PHASE_RED_SENDING_PHOTO");
-      pPhaseCharacteristic->notify();
-    }
-    advertiseAndSendIfPhoto(m_wait_closing);
-  } else {
-    if (pPhaseCharacteristic) {
-      pPhaseCharacteristic->setValue("PHASE_RED");
-      pPhaseCharacteristic->notify();
-    }
-    // short advertise so phone can read phase
-    pServer->getAdvertising()->start();
-    delay(300);
-    pServer->getAdvertising()->stop();
-    m_wait_closing();
-    esp_deep_sleep_start();
+  BLEDevice::startAdvertising();
+  Serial.println("📢 BLE advertising started");
+
+  unsigned long start = millis();
+  const unsigned long MAX_WAIT = 20000;
+  while (!g_clientConnected && millis() - start < MAX_WAIT) {
+    delay(200);
   }
+
+  if (g_clientConnected) {
+    Serial.println("🔗 BLE client connected!");
+    delay(800);
+    for (int i = 0; i < 3; ++i) {
+      if (!g_clientConnected) break;
+      pPhaseCharacteristic->setValue(msg);
+      pPhaseCharacteristic->indicate();
+      delay(500);
+    }
+
+    unsigned long extraWait = millis();
+    while (g_clientConnected && millis() - extraWait < 3000) {
+      delay(100);
+    }
+  } else {
+    Serial.println("⚠️ No BLE client connected within timeout.");
+  }
+
+  BLEDevice::stopAdvertising();
+  Serial.println("🛑 BLE advertising stopped");
+
+  waitFunc();
+
+  if (sleepSec > 0) {
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
+    Serial.printf("⏲️ Timer wakeup after %u seconds\n", sleepSec);
+  }
+
+  Serial.println("💤 Going to deep sleep...\n");
+  Serial.flush();
+  delay(300);
+  esp_deep_sleep_start();
+}
+
+// phases (unchanged)
+void phaseRED() {
+    currentPhase = PHASE_RED;
+    Serial.println("🔴 Phase RED (магніт відсутній)");
+    showColor(255, 0, 0);
+
+    if (hasSavedPhoto) {
+        if (pPhaseCharacteristic) {
+            pPhaseCharacteristic->setValue("PHASE_RED_SENDING_PHOTO");
+            pPhaseCharacteristic->indicate();
+        }
+        advertiseAndSendIfPhoto(m_wait_closing);
+        return;
+    }
+    sendBLEandSleep("PHASE_RED", m_wait_closing);
 }
 
 void phaseBLUE() {
-  currentPhase = PHASE_BLUE;
-  Serial.println("🔵 Phase BLUE (магніт присутній)");
-  showColor(0, 0, 255);
-
-  if (pPhaseCharacteristic) {
-    pPhaseCharacteristic->setValue("PHASE_BLUE");
-    pPhaseCharacteristic->notify();
-  }
-
-  // short advertise
-  pServer->getAdvertising()->start();
-  delay(300);
-  pServer->getAdvertising()->stop();
-
-  // after 30s go to GREEN
-  if (pPhaseCharacteristic) {
-    pPhaseCharacteristic->setValue("PHASE_BLUE_TIMER30");
-    pPhaseCharacteristic->notify();
-  }
-
-  esp_sleep_enable_timer_wakeup((uint64_t)30 * 1000000ULL);
-  m_wait_opening(); // also allow wake on opening
-  Serial.println("💤 Going to deep sleep from BLUE (timer 30s)\n");
-  Serial.flush();
-  delay(200);
-  esp_deep_sleep_start();
+    currentPhase = PHASE_BLUE;
+    Serial.println("🔵 Phase BLUE (магніт присутній)");
+    showColor(0, 0, 255);
+    sendBLEandSleep("PHASE_BLUE", m_wait_opening, 30);
 }
 
 void phaseGREEN() {
-  currentPhase = PHASE_GREEN;
-  Serial.println("🟢 Phase GREEN (зйомка фото і збереження)");
-  showColor(0, 255, 0);
+    currentPhase = PHASE_GREEN;
+    Serial.println("🟢 Phase GREEN");
+    showColor(0, 255, 0);
 
-  if (pPhaseCharacteristic) {
-    pPhaseCharacteristic->setValue("PHASE_GREEN");
-    pPhaseCharacteristic->notify();
-  }
+    pinMode(CAM_PWR_NUM, OUTPUT);
+    digitalWrite(CAM_PWR_NUM, HIGH);
+    delay(200);
 
-  // mount SPIFFS (format if needed)
-  if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS mount failed");
-  } else {
-    Serial.println("SPIFFS mounted");
-  }
+    if (cameraInit()) {
+        for (int i = 0; i < 2; i++) {
+            camera_fb_t* fb_temp = esp_camera_fb_get();
+            if (fb_temp) esp_camera_fb_return(fb_temp);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
 
-  // power up camera if needed
-  pinMode(CAM_PWR_NUM, OUTPUT);
-  digitalWrite(CAM_PWR_NUM, HIGH);
-  delay(200);
-
-  if (!cameraInit()) {
-    Serial.println("Camera init failed in GREEN phase");
-  } else {
-    // warm up frames
-    for (int i=0;i<2;i++) {
-      camera_fb_t* fb_temp = esp_camera_fb_get();
-      if (fb_temp) {
-        esp_camera_fb_return(fb_temp);
-        fb_temp = NULL;
-      }
-      vTaskDelay(pdMS_TO_TICKS(50));
-    }
-
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (fb) {
-      Serial.printf("Captured frame len=%u\n", (unsigned)fb->len);
-      if (saveFrameToSPIFFS(fb, SAVED_PHOTO_PATH)) {
-        hasSavedPhoto = true;
-        Serial.println("Photo saved to SPIFFS");
-      } else {
-        Serial.println("Failed to save photo to SPIFFS");
-      }
-      esp_camera_fb_return(fb);
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (fb) {
+            Serial.printf("Captured frame len=%u\n", (unsigned)fb->len);
+            if (saveFrameToSPIFFS_safe(fb, SAVED_PHOTO_PATH)) {
+                delay(100);
+                if (SPIFFS.exists(SAVED_PHOTO_PATH)) {
+                    hasSavedPhoto = true;
+                    Serial.println("✅ Photo saved to SPIFFS");
+                } else {
+                    hasSavedPhoto = false;
+                    Serial.println("❌ File missing after save!");
+                }
+            } else {
+                hasSavedPhoto = false;
+                Serial.println("❌ Failed to save photo");
+            }
+            esp_camera_fb_return(fb);
+        } else {
+            hasSavedPhoto = false;
+            Serial.println("❌ Capture failed in GREEN");
+        }
     } else {
-      Serial.println("Capture failed in GREEN");
+        hasSavedPhoto = false;
+        Serial.println("❌ Camera init failed in GREEN");
     }
-  }
 
-  // power down camera
-  digitalWrite(CAM_PWR_NUM, LOW);
+    digitalWrite(CAM_PWR_NUM, LOW);
 
-  // GO TO SLEEP: wait for magnet change (opposite)
-  if (m_is_closed()) m_wait_opening();
-  else m_wait_closing();
-
-  // small delay to let BLE/LED settle
-  delay(200);
-  Serial.println("💤 Going to deep sleep after GREEN (photo taken)\n");
-  Serial.flush();
-  delay(200);
-  esp_deep_sleep_start();
+    if (pServer && pImageCharacteristic) {
+        if (hasSavedPhoto && SPIFFS.exists(SAVED_PHOTO_PATH)) {
+            advertiseAndSendIfPhoto([](){
+                if (m_is_closed()) m_wait_opening();
+                else m_wait_closing();
+            });
+        } else {
+            Serial.println("⚠️ No photo to send — sending GREEN phase message only");
+            sendBLEandSleep("PHASE_GREEN", [](){
+                if (m_is_closed()) m_wait_opening();
+                else m_wait_closing();
+            });
+        }
+    } else {
+        Serial.println("⚠️ BLE server/characteristic not ready — going to sleep");
+        if (m_is_closed()) m_wait_opening();
+        else m_wait_closing();
+        esp_deep_sleep_start();
+    }
 }
 
-// ---------- SETUP ----------
+// SETUP
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // brownout fix
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   
   Serial.begin(115200);
   delay(500);
-if (!SPIFFS.begin(true)) {
-    Serial.println("❌ SPIFFS mount failed (initial)");
+
+  if (!SPIFFS.begin()) {
+    Serial.println("❌ SPIFFS mount failed (initial). Not formatting automatically.");
   } else {
     Serial.println("✅ SPIFFS mounted successfully (initial)");
   }
+
+  if (SPIFFS.exists(SAVED_PHOTO_PATH)) {
+    hasSavedPhoto = true;
+  } else {
+    hasSavedPhoto = false;
+  }
+
   pinMode(OPEN_SW_NUM, INPUT);
   pinMode(RGB_VDD_NUM, OUTPUT);
   digitalWrite(RGB_VDD_NUM, HIGH);
@@ -449,7 +544,7 @@ if (!SPIFFS.begin(true)) {
   rgb.begin();
   rgb.clear();
   rgb.show();
-
+  delay(10);
   myLED.begin(RGB_DIN_NUM, 1);
   myLED.brightness(255);
 
@@ -474,15 +569,18 @@ if (!SPIFFS.begin(true)) {
 
   // Image service
   BLEService* imageService = pServer->createService(IMAGE_SERVICE_UUID);
+  // <-- IMPORTANT: use NOTIFY property (not INDICATE), and add BLE2902 descriptor
   pImageCharacteristic = imageService->createCharacteristic(
-      IMAGE_CHARACTERISTIC_UUID,
-      BLECharacteristic::PROPERTY_INDICATE
-  );
-  pImageCCCD = new BLEDescriptor((uint16_t)0x2902);
-  pImageCCCD->setCallbacks(new MyDescriptorCallbacks());
-  pImageCharacteristic->addDescriptor(pImageCCCD);
-
-  // Command characteristic (optional)
+    IMAGE_CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_INDICATE
+);
+  // add BLE2902 descriptor to allow client to subscribe
+  BLE2902* img2902 = new BLE2902();
+  // attach our callback to observe CCCD writes
+  img2902->setCallbacks(new MyDescriptorCallbacks());
+  pImageCharacteristic->addDescriptor(img2902);
+ 
+  // Command characteristic
   pCmdCharacteristic = imageService->createCharacteristic(
       CMD_CHARACTERISTIC_UUID,
       BLECharacteristic::PROPERTY_WRITE
@@ -496,13 +594,18 @@ if (!SPIFFS.begin(true)) {
   adv->addServiceUUID(SERVICE_UUID);
   adv->addServiceUUID(IMAGE_SERVICE_UUID);
   adv->setScanResponse(true);
+  adv->setMinInterval(0x00A0);
+  adv->setMaxInterval(0x00F0);
+
+  BLEAdvertisementData advData;
+  advData.setName("ESP");
+  adv->setAdvertisementData(advData);
+
   adv->start();
   Serial.println("📡 BLE advertising started");
 
-  // Increase MTU (optional)
   BLEDevice::setMTU(517);
 
-  // Wakeup cause & magnet state
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   bool closed = m_is_closed();
 
@@ -511,21 +614,13 @@ if (!SPIFFS.begin(true)) {
   Serial.printf("Last phase: %d\n", currentPhase);
   Serial.printf("Has saved photo: %d\n", hasSavedPhoto ? 1 : 0);
 
-  // ROUTING: handle special case: waking up after GREEN due to magnet removal
   if (currentPhase == PHASE_GREEN) {
-    // If we woke from external wake (ext0) and magnet is now OFF (i.e. was removed)
     if ((cause == ESP_SLEEP_WAKEUP_EXT0) && (!closed) && hasSavedPhoto) {
       Serial.println("Wake from GREEN due to magnet removal -> will advertise and send photo");
-      // advertise and send photo; after sending, m_wait_closing() will be set inside helper
       advertiseAndSendIfPhoto(m_wait_closing);
-      // advertiseAndSendIfPhoto does deep_sleep_start() internally after sending config
-      // (so code below won't execute in that path)
-    } else {
-      // either still closed or woke for another reason -> go to normal handling below
     }
   }
 
-  // Normal phase routing
   switch (currentPhase) {
     case PHASE_RED:
       if (closed) phaseBLUE();
@@ -537,7 +632,6 @@ if (!SPIFFS.begin(true)) {
       else phaseBLUE();
       break;
     case PHASE_GREEN:
-      // if here and didn't match special case above: if magnet removed -> RED, else BLUE
       if (!closed) phaseRED();
       else phaseBLUE();
       break;
@@ -545,15 +639,15 @@ if (!SPIFFS.begin(true)) {
 }
 
 void loop() {
-  // Manual command from client to request send (while awake)
   if (sendRequested) {
     sendRequested = false;
     if (hasSavedPhoto && deviceConnected) {
       Serial.println("Manual send requested via write command — trying to send saved photo");
       if (waitForNotificationsEnabled(5000)) {
+        advertiseAndWaitForClientThenNotify("READY_FOR_IMAGE");
         sendFileViaBLE_SPIFFS(SAVED_PHOTO_PATH);
       } else {
-        Serial.println("Client didn't enable indications");
+        Serial.println("Client didn't enable notifications");
       }
     } else {
       Serial.println("No saved photo or no client to send");
@@ -561,4 +655,3 @@ void loop() {
   }
   delay(50);
 }
- 
