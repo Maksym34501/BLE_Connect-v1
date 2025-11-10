@@ -41,7 +41,7 @@ bool deviceConnected = false;
 // зберігаємо обидва стани для діагностики
 volatile bool cccd_notify_enabled = false;     // bit 0 (0x0001)
 volatile bool cccd_indicate_enabled = false;   // bit 1 (0x0002)
-// Зручний хуткий флаг, який означає "клієнт підписався (взагалі)"
+// прапорець, який означає "клієнт підписався (взагалі)"
 volatile bool clientSubscribed = false;
 Adafruit_NeoPixel rgb(1, RGB_DIN_NUM, NEO_GRB + NEO_KHZ800);
 LiteLED myLED(LED_STRIP_SK6812, true);
@@ -107,14 +107,15 @@ class PhaseServerCallbacks: public BLEServerCallbacks {
 void onConnect(BLEServer* pServer) override {
 g_clientConnected = true;
 deviceConnected = true;
-Serial.println("🔗 BLE client connected");
+Serial.println("BLE client connected");
 }
 void onDisconnect(BLEServer* pServer) override {
 g_clientConnected = false;
 deviceConnected = false;
 notificationsEnabled = false;
-Serial.println("⚠️ BLE client disconnected");
-pServer->getAdvertising()->start();
+Serial.println("BLE client disconnected");
+ delay(500); // коротка пауза
+	BLEDevice::startAdvertising(); 
 }
 };
 // --- ОНОВЛЕНА MyDescriptorCallbacks ---
@@ -128,7 +129,7 @@ class MyDescriptorCallbacks : public BLEDescriptorCallbacks {
       cccd_notify_enabled = (val & 0x0001) != 0;
       cccd_indicate_enabled = (val & 0x0002) != 0;
 
-      // Вважай підписку валідною, якщо встановлено хоча б один з бітів.
+      // Вважаємо підписку валідною, якщо встановлено хоча б один з бітів.
       clientSubscribed = cccd_notify_enabled || cccd_indicate_enabled;
 
       Serial.printf("CCCD written: 0x%04X, notify=%d, indicate=%d, subscribed=%d\n",
@@ -155,15 +156,15 @@ bool waitForNotificationsEnabled(uint32_t timeoutMs) {
 // --- передача буфера зображення без збереження ---
  void sendBufferViaBLE(uint8_t* data, size_t len) {
     if (!deviceConnected || !clientSubscribed) {
-        Serial.println("⚠️ BLE client not ready for image (not connected or not subscribed)");
+        Serial.println("BLE client not ready for image (not connected or not subscribed)");
         return;
     }
 
-    const size_t chunkSize = 500; // або 180..500 в залежності від MTU/стабільності
+    const size_t chunkSize = 300; // кількість байтів в одному пакеті
     const char* startMsg = "START";
     const char* endMsg   = "END";
 
-    // Надсилаємо START (ми використовуємо indicate() завжди)
+    // Надсилаємо START ( через indicate )
     pImageCharacteristic->setValue((uint8_t*)startMsg, strlen(startMsg));
     pImageCharacteristic->indicate();
     delay(200); // даємо клієнту час обробити START
@@ -172,13 +173,13 @@ bool waitForNotificationsEnabled(uint32_t timeoutMs) {
     while (sent < len) {
         size_t toSend = min(chunkSize, len - sent);
         pImageCharacteristic->setValue(data + sent, toSend);
-        pImageCharacteristic->indicate(); // НАМЕРТВО: indicate()
+        pImageCharacteristic->indicate(); 
         sent += toSend;
-
+        // !! Прибрати в релізі !!
         Serial.printf("Sent chunk %u/%u\n", (unsigned)sent, (unsigned)len);
 
-        // невелика пауза для стабільності (можна зменшити, якщо тест показує стабільність)
-        delay(5);
+        // невелика пауза для стабільності 
+        // delay(50);
     }
 
     // Надсилаємо END
@@ -186,7 +187,7 @@ bool waitForNotificationsEnabled(uint32_t timeoutMs) {
     pImageCharacteristic->indicate();
     delay(200);
 
-    Serial.println("✅ Image buffer sent successfully (all via indicate())");
+    Serial.println("Image buffer sent successfully (all via indicate())");
 }
 
 
@@ -205,12 +206,12 @@ delay(500);
 }
 delay(postNotifyWaitMs);
 } else {
-Serial.println("⚠️ No BLE client connected within timeout");
+Serial.println("No BLE client connected within timeout");
 }
 adv->stop();
 }
 
-// --- ФАЗИ ---
+
 void sendBLEandSleep(const char* msg, void (*waitFunc)(), uint32_t sleepSec = 0) {
 BLEDevice::startAdvertising();
 unsigned long start = millis();
@@ -230,10 +231,10 @@ if (sleepSec > 0)
 esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
 esp_deep_sleep_start();
 }
-
+// ------------------ ФАЗИ ------------------ 
 void phaseRED() {
 currentPhase = PHASE_RED;
-Serial.println("🔴 Phase RED (магніт відсутній)");
+Serial.println("Phase RED (магніт відсутній)");
 showColor(255, 0, 0);
 // Вилучено відправку фото
 sendBLEandSleep("PHASE_RED", m_wait_closing);
@@ -241,14 +242,14 @@ sendBLEandSleep("PHASE_RED", m_wait_closing);
 
 void phaseBLUE() {
 currentPhase = PHASE_BLUE;
-Serial.println("🔵 Phase BLUE (магніт присутній)");
+Serial.println("Phase BLUE (магніт присутній)");
 showColor(0, 0, 255);
-sendBLEandSleep("PHASE_BLUE", m_wait_opening, 30);
+sendBLEandSleep("PHASE_BLUE", m_wait_opening, 2400);
 }
 
 void phaseGREEN() {
     currentPhase = PHASE_GREEN;
-    Serial.println("🟢 Phase GREEN");
+    Serial.println("Phase GREEN");
     showColor(0, 255, 0);
 
     pinMode(CAM_PWR_NUM, OUTPUT);
@@ -256,19 +257,19 @@ void phaseGREEN() {
     delay(200);
 
     if (!cameraInit()) {
-        Serial.println("❌ Camera init failed");
+        Serial.println(" Camera init failed");
         digitalWrite(CAM_PWR_NUM, LOW);
         return;
     }
 
-    // прогрів камери
+    // прогрів камери ( для балансу кольорів)
     for (int i = 0; i < 2; i++) {
         camera_fb_t* fb_temp = esp_camera_fb_get();
         if (fb_temp) esp_camera_fb_return(fb_temp);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    // --- ПІДСВІТКА: вмикаємо біле для зйомки прямо перед захопленням ---
+    // ПІДСВІТКА: вмикаємо біле для зйомки прямо перед захопленням
     enableFlashForCapture();
 
     camera_fb_t* fb = esp_camera_fb_get();
@@ -277,7 +278,7 @@ void phaseGREEN() {
     restoreFlashAfterCapture();
 
     if (!fb) {
-        Serial.println("❌ Failed to capture photo");
+        Serial.println("Failed to capture photo");
         digitalWrite(CAM_PWR_NUM, LOW);
         return;
     }
@@ -291,15 +292,21 @@ void phaseGREEN() {
     while (!deviceConnected && millis() - start < 20000) delay(50);
 
     if (!deviceConnected) {
-        Serial.println("⚠️ No BLE client connected within timeout");
-        esp_camera_fb_return(fb);
-        digitalWrite(CAM_PWR_NUM, LOW);
-        return;
-    }
+       Serial.println("No BLE client connected within timeout");
+    esp_camera_fb_return(fb);
+    digitalWrite(CAM_PWR_NUM, LOW);
+
+    // Вибір фази очікування перед сном (щоб при наступному циклі він знову пробував)
+    if (m_is_closed()) m_wait_opening();
+    else m_wait_closing();
+
+    esp_sleep_enable_timer_wakeup(30ULL * 1000000ULL); // спати 30 секунд
+    esp_deep_sleep_start();
+}
 
     // --- чекати індикації ---
     if (!waitForNotificationsEnabled(20000)) {
-        Serial.println("⚠️ BLE client not enabled notifications");
+        Serial.println("BLE client not enabled notifications");
         esp_camera_fb_return(fb);
         digitalWrite(CAM_PWR_NUM, LOW);
         return;
@@ -323,8 +330,6 @@ void phaseGREEN() {
  
     if (m_is_closed()) m_wait_opening();
     else m_wait_closing();
-
- 
 
     esp_deep_sleep_start();
 }
@@ -418,6 +423,9 @@ BLEAdvertising* adv = pServer->getAdvertising();
 adv->addServiceUUID(SERVICE_UUID);
 adv->addServiceUUID(IMAGE_SERVICE_UUID);
 adv->start();
+adv->setMinInterval(0x30);  // 48 * 0.625мс = ~30мс
+adv->setMaxInterval(0x50);  // 80 * 0.625мс = ~50мс
+adv->setScanResponse(true); // дозволяє клієнту бачити ім'я пристрою
 
 BLEDevice::setMTU(517);
 
